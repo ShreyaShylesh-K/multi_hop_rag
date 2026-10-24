@@ -3,9 +3,12 @@ from io import BytesIO
 
 import chromadb
 from google import genai
+from google.genai import types
 import streamlit as st
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
+
+from image_filter import IMAGE_EXTENSIONS, ImageLimits, check_image, is_image_file
 
 
 MODEL_NAME = "gemini-3.5-flash-lite"
@@ -17,7 +20,7 @@ TOP_K = 3
 st.set_page_config(page_title="Multi-Hop RAG", page_icon="🔎")
 st.title("Multi-Hop RAG Question Answering")
 st.write(
-    "Upload text or PDF documents, then ask a question that may require "
+    "Upload text, PDF, or image documents, then ask a question that may require "
     "connecting information across them."
 )
 
@@ -33,10 +36,29 @@ def get_collection():
     return client.get_or_create_collection(name="project_documents")
 
 
+def describe_image(file_bytes, mime_type):
+    """Ask Gemini to transcribe and describe an image so it can be indexed."""
+    client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+    response = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=[
+            types.Part.from_bytes(data=file_bytes, mime_type=mime_type),
+            "Transcribe all readable text in this image exactly. Then describe "
+            "the image in detail, including any charts, tables, people, places, "
+            "or objects, so the description can be searched later.",
+        ],
+    )
+    return (response.text or "").strip()
+
+
 def extract_pages(uploaded_file):
-    """Return a list of (text, page_number) pairs from a PDF or TXT file."""
+    """Return a list of (text, page_number) pairs from a PDF, TXT, or image file."""
     file_name = uploaded_file.name
     file_bytes = uploaded_file.getvalue()
+
+    if is_image_file(file_name):
+        mime_type = uploaded_file.type or "image/png"
+        return [(describe_image(file_bytes, mime_type), None)]
 
     if file_name.lower().endswith(".pdf"):
         reader = PdfReader(BytesIO(file_bytes))
@@ -66,16 +88,27 @@ def split_into_chunks(text, max_words=180, overlap=30):
     return chunks
 
 
-def index_files(uploaded_files):
-    """Read, chunk, embed, and save the uploaded files in Chroma."""
+def index_files(uploaded_files, image_limits):
+    """Read, chunk, embed, and save the uploaded files in Chroma.
+
+    Images that fail the size or dimension limits are skipped and returned
+    as a list of (file_name, problems) pairs.
+    """
     embedder = get_embedder()
     collection = get_collection()
 
     all_chunks = []
     all_metadata = []
     all_ids = []
+    rejected = []
 
     for uploaded_file in uploaded_files:
+        if is_image_file(uploaded_file.name):
+            _, _, problems = check_image(uploaded_file.getvalue(), image_limits)
+            if problems:
+                rejected.append((uploaded_file.name, problems))
+                continue
+
         for page_text, page_number in extract_pages(uploaded_file):
             chunks = split_into_chunks(page_text)
 
@@ -96,6 +129,8 @@ def index_files(uploaded_files):
                 all_ids.append(chunk_id)
 
     if not all_chunks:
+        if rejected:
+            return 0, rejected
         raise ValueError(
             "I couldn't extract text. If this is a scanned PDF, it may need OCR."
         )
@@ -113,7 +148,7 @@ def index_files(uploaded_files):
         embeddings=vectors.tolist(),
     )
 
-    return len(all_chunks)
+    return len(all_chunks), rejected
 
 
 def retrieve(query, top_k=TOP_K):
@@ -260,9 +295,41 @@ with st.sidebar:
     st.header("Your documents")
 
     uploaded_files = st.file_uploader(
-        "Choose PDF or TXT files",
-        type=["pdf", "txt"],
+        "Choose PDF, TXT, or image files",
+        type=["pdf", "txt", *IMAGE_EXTENSIONS],
         accept_multiple_files=True,
+    )
+
+    with st.expander("Image limits"):
+        defaults = ImageLimits()
+        min_col, max_col = st.columns(2)
+        with min_col:
+            min_width = st.number_input(
+                "Min width (px)", min_value=1, value=defaults.min_width
+            )
+            min_height = st.number_input(
+                "Min height (px)", min_value=1, value=defaults.min_height
+            )
+        with max_col:
+            max_width = st.number_input(
+                "Max width (px)", min_value=1, value=defaults.max_width
+            )
+            max_height = st.number_input(
+                "Max height (px)", min_value=1, value=defaults.max_height
+            )
+        max_size_mb = st.number_input(
+            "Max file size (MB)",
+            min_value=0.1,
+            value=defaults.max_size_mb,
+            step=0.5,
+        )
+
+    image_limits = ImageLimits(
+        min_width=int(min_width),
+        min_height=int(min_height),
+        max_width=int(max_width),
+        max_height=int(max_height),
+        max_size_mb=float(max_size_mb),
     )
 
     if st.button("Index documents", type="primary"):
@@ -271,8 +338,13 @@ with st.sidebar:
         else:
             try:
                 with st.spinner("Reading and indexing your documents..."):
-                    number_of_chunks = index_files(uploaded_files)
-                st.success(f"Indexed {number_of_chunks} text chunks.")
+                    number_of_chunks, rejected = index_files(
+                        uploaded_files, image_limits
+                    )
+                for file_name, problems in rejected:
+                    st.warning(f"Skipped {file_name}: {'; '.join(problems)}.")
+                if number_of_chunks:
+                    st.success(f"Indexed {number_of_chunks} text chunks.")
             except Exception as error:
                 st.error(f"Indexing failed: {error}")
 
